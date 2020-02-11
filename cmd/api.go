@@ -30,14 +30,13 @@ func init() {
 	rootCmd.AddCommand(issuance)
 	rootCmd.AddCommand(status)
 	rootCmd.AddCommand(burn)
+	rich.Flags().Int("count", 100, "The top X address")
+	rootCmd.AddCommand(rich)
 
 	get.AddCommand(getTX)
 	get.AddCommand(getRates)
 	getBank.Flags().Bool("raw", false, "Print the full json data")
 	get.AddCommand(getBank)
-	rich.Flags().Int("count", 100, "The top X address")
-	rootCmd.AddCommand(rich)
-
 	getTXs.Flags().Bool("burn", false, "Show burns")
 	getTXs.Flags().Bool("cvt", false, "Show converions")
 	getTXs.Flags().Bool("tran", false, "Show transfers")
@@ -698,7 +697,7 @@ var getTXs = &cobra.Command{
 
 var getRates = &cobra.Command{
 	Use:              "rates <height>",
-	Short:            "Fetch the pegnet quotes for the assets at a given height (if there are quotes)",
+	Short:            "Fetch the pegnet quotes for the assets at a given height (if their are quotes)",
 	PersistentPreRun: always,
 	PreRun:           SoftReadConfig,
 	Args:             cobra.MaximumNArgs(1),
@@ -715,15 +714,19 @@ var getRates = &cobra.Command{
 
 		cl := srv.NewClient()
 		cl.PegnetdServer = viper.GetString(config.Pegnetd)
-		var res map[string]uint64
-		uH := uint32(height)
-		err = cl.Request("get-pegnet-rates", srv.ParamsGetPegnetRates{Height: uH}, &res)
+		res, err := getPegnetRates(uint32(height), cl)
 		if err != nil {
 			fmt.Printf("Failed to make RPC request\nDetails:\n%v\n", err)
 			os.Exit(1)
 		}
 
-		data, err := json.Marshal(res)
+		// Change the units to be human readable
+		humanBals := make(map[string]string)
+		for k, bal := range res {
+			humanBals[k.String()] = FactoshiToFactoid(int64(bal))
+		}
+
+		data, err := json.Marshal(humanBals)
 		if err != nil {
 			panic(err)
 		}
