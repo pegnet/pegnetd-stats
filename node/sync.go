@@ -83,14 +83,27 @@ OuterSyncLoop:
 				hLog.WithError(err).Errorf("failed to start transaction")
 				continue
 			}
+			stats := pegnet.NewStats(d.Sync.Synced + 1)
+
 			// We are not synced, so we need to iterate through the dblocks and sync them
 			// one by one. We can only sync our current synced height +1
 			// TODO: This skips the genesis block. I'm sure that is fine
-			if err := d.SyncBlock(ctx, tx, d.Sync.Synced+1); err != nil {
+			if err := d.SyncBlock(ctx, tx, stats, d.Sync.Synced+1); err != nil {
 				hLog.WithError(err).Errorf("failed to sync height")
 				time.Sleep(retryPeriod)
 				// If we fail, we backout to the outer loop. This allows error handling on factomd state to be a bit
 				// cleaner, such as a rebooted node with a different db. That node would have a new heights response.
+				err = tx.Rollback()
+				if err != nil {
+					// TODO evaluate if we can recover from this point or not
+					hLog.WithError(err).Fatal("unable to roll back transaction")
+				}
+				continue OuterSyncLoop
+			}
+
+			err = d.Pegnet.InsertStats(tx, stats)
+			if err != nil {
+				hLog.WithError(err).Errorf("unable to update stats")
 				err = tx.Rollback()
 				if err != nil {
 					// TODO evaluate if we can recover from this point or not
@@ -158,7 +171,7 @@ OuterSyncLoop:
 // If SyncBlock returns no error, than that height was synced and saved. If any part of the sync fails,
 // the whole sync should be rolled back and not applied. An error should then be returned.
 // The context should be respected if it is cancelled
-func (d *Pegnetd) SyncBlock(ctx context.Context, tx *sql.Tx, height uint32) error {
+func (d *Pegnetd) SyncBlock(ctx context.Context, tx *sql.Tx, stats *pegnet.Stats, height uint32) error {
 	fLog := log.WithFields(log.Fields{"height": height})
 	if isDone(ctx) { // Just an example about how to handle it being cancelled
 		return context.Canceled
@@ -239,14 +252,14 @@ func (d *Pegnetd) SyncBlock(ctx context.Context, tx *sql.Tx, height uint32) erro
 				return err
 			}
 
-			if err = d.ApplyTransactionBatchesInHolding(ctx, tx, height, rates); err != nil {
+			if err = d.ApplyTransactionBatchesInHolding(ctx, tx, stats, height, rates); err != nil {
 				return err
 			}
 		}
 
 		// 2) Sync transactions in current height and apply transactions
 		if transactionsEBlock != nil {
-			if err = d.ApplyTransactionBlock(tx, transactionsEBlock); err != nil {
+			if err = d.ApplyTransactionBlock(tx, stats, transactionsEBlock); err != nil {
 				return err
 			}
 		}
@@ -255,14 +268,14 @@ func (d *Pegnetd) SyncBlock(ctx context.Context, tx *sql.Tx, height uint32) erro
 	// 3) Apply FCT --> pFCT burns that happened in this block
 	//    These funds will be available for transactions and conversions executed in the next block
 	// TODO: Check the order of operations on this and what block to add burns from.
-	if err := d.ApplyFactoidBlock(ctx, tx, dblock); err != nil {
+	if err := d.ApplyFactoidBlock(ctx, tx, stats, dblock); err != nil {
 		return err
 	}
 
 	// 4) Apply effects of graded OPR Block (PEG rewards, if any)
 	//    These funds will be available for transactions and conversions executed in the next block
 	if gradedBlock != nil {
-		if err := d.ApplyGradedOPRBlock(tx, gradedBlock, dblock.Timestamp); err != nil {
+		if err := d.ApplyGradedOPRBlock(tx, stats, gradedBlock, dblock.Timestamp); err != nil {
 			return err
 		}
 	}
@@ -330,7 +343,7 @@ func (d *Pegnetd) SyncBank(ctx context.Context, sqlTx *sql.Tx, currentHeight uin
 // ApplyTransactionBatchesInHolding attempts to apply the transaction batches from previous
 // blocks that were put into holding because they contained conversions.
 // If an error is returned, the sql.Tx should be rolled back by the caller.
-func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *sql.Tx, currentHeight uint32, rates map[fat2.PTicker]uint64) error {
+func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *sql.Tx, stats *pegnet.Stats, currentHeight uint32, rates map[fat2.PTicker]uint64) error {
 	_, height, err := d.Pegnet.SelectMostRecentRatesBeforeHeight(ctx, sqlTx, currentHeight)
 	if err != nil {
 		return err
@@ -365,7 +378,7 @@ func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *s
 
 			// This will apply all batche inputs, and all batch outputs except
 			// conversions to PEG if we are above the PegnetConversionLimit Act
-			err = d.applyTransactionBatch(sqlTx, txBatch, rates, currentHeight)
+			err = d.applyTransactionBatch(sqlTx, txBatch, stats, rates, currentHeight)
 			// The err needs to be converted to a code. If the err is still
 			// not nil, then the code is 0 and the error is probably db related.
 			// If the code is < 0, the tx is rejected.
@@ -396,7 +409,7 @@ func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *s
 		if currentHeight >= PegnetConversionLimitActivation && currentHeight < V4OPRUpdate {
 			// All heights before v4 use the currentHeight-1 with a 5K PEG bank
 			bank := pegnet.BankBaseAmount
-			err = d.recordPegnetRequests(sqlTx, pegConversions, rates, currentHeight, bank, int32(currentHeight-1))
+			err = d.recordPegnetRequests(sqlTx, stats, pegConversions, rates, currentHeight, bank, int32(currentHeight-1))
 			if err != nil {
 				return err
 			}
@@ -411,7 +424,7 @@ func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *s
 		if err != nil {
 			return err
 		}
-		err = d.recordPegnetRequests(sqlTx, pegConversions, rates, currentHeight, uint64(bentry.BankAmount), int32(currentHeight))
+		err = d.recordPegnetRequests(sqlTx, stats, pegConversions, rates, currentHeight, uint64(bentry.BankAmount), int32(currentHeight))
 		if err != nil {
 			return err
 		}
@@ -422,7 +435,7 @@ func (d *Pegnetd) ApplyTransactionBatchesInHolding(ctx context.Context, sqlTx *s
 // ApplyTransactionBlock puts conversion-containing transaction batches into holding,
 // and applys the balance updates for all transaction batches able to be executed
 // immediately. If an error is returned, the sql.Tx should be rolled back by the caller.
-func (d *Pegnetd) ApplyTransactionBlock(sqlTx *sql.Tx, eblock *factom.EBlock) error {
+func (d *Pegnetd) ApplyTransactionBlock(sqlTx *sql.Tx, stats *pegnet.Stats, eblock *factom.EBlock) error {
 	for blockorder, entry := range eblock.Entries {
 		txBatch, err := fat2.NewTransactionBatch(entry, int32(eblock.Height))
 		if err != nil {
@@ -459,7 +472,7 @@ func (d *Pegnetd) ApplyTransactionBlock(sqlTx *sql.Tx, eblock *factom.EBlock) er
 		}
 
 		// No conversions in the batch, it can be applied immediately
-		if err = d.applyTransactionBatch(sqlTx, txBatch, nil, eblock.Height); err != nil &&
+		if err = d.applyTransactionBatch(sqlTx, txBatch, stats, nil, eblock.Height); err != nil &&
 			err != pegnet.InsufficientBalanceErr { // Allowed Exception
 			return err
 		} else if err == pegnet.InsufficientBalanceErr {
@@ -471,7 +484,7 @@ func (d *Pegnetd) ApplyTransactionBlock(sqlTx *sql.Tx, eblock *factom.EBlock) er
 
 // applyTransactionBatch
 //	currentHeight is just for tracing
-func (d *Pegnetd) applyTransactionBatch(sqlTx *sql.Tx, txBatch *fat2.TransactionBatch, rates map[fat2.PTicker]uint64, currentHeight uint32) error {
+func (d *Pegnetd) applyTransactionBatch(sqlTx *sql.Tx, txBatch *fat2.TransactionBatch, stats *pegnet.Stats, rates map[fat2.PTicker]uint64, currentHeight uint32) error {
 	balances := make(map[factom.FAAddress]map[fat2.PTicker]uint64)
 
 	// We need to do all checks up front, then apply the tx
@@ -541,7 +554,7 @@ func (d *Pegnetd) applyTransactionBatch(sqlTx *sql.Tx, txBatch *fat2.Transaction
 	}
 
 	// The tx batch should be 100% valid to apply
-	err := d.recordBatch(sqlTx, txBatch, rates, currentHeight)
+	err := d.recordBatch(sqlTx, txBatch, rates, stats, currentHeight)
 	if err != nil {
 		return err
 	}
@@ -557,7 +570,7 @@ func (d *Pegnetd) applyTransactionBatch(sqlTx *sql.Tx, txBatch *fat2.Transaction
 
 // recordBatch will submit the batch to the database. We assume the tx is 100%
 // valid at this point.
-func (d *Pegnetd) recordBatch(sqlTx *sql.Tx, txBatch *fat2.TransactionBatch, rates map[fat2.PTicker]uint64, currentHeight uint32) error {
+func (d *Pegnetd) recordBatch(sqlTx *sql.Tx, txBatch *fat2.TransactionBatch, rates map[fat2.PTicker]uint64, stats *pegnet.Stats, currentHeight uint32) error {
 	for txIndex, tx := range txBatch.Transactions {
 		_, txErr, err := d.Pegnet.SubFromBalance(sqlTx, &tx.Input.Address, tx.Input.Type, tx.Input.Amount)
 		if err != nil {
@@ -600,7 +613,20 @@ func (d *Pegnetd) recordBatch(sqlTx *sql.Tx, txBatch *fat2.TransactionBatch, rat
 			if err != nil {
 				return err
 			}
-		} else { // Transfer Outputs
+			stats.Volume[tx.Input.Type.String()] += tx.Input.Amount
+
+			pUSDEquiv, err := conversions.Convert(int64(tx.Input.Amount), rates[tx.Input.Type], rates[fat2.PTickerUSD])
+			if err != nil {
+				return err
+			}
+			stats.VolumeOut[tx.Input.Type.String()] += tx.Input.Amount
+			stats.ConversionTotal += uint64(pUSDEquiv)
+			stats.Volume[tx.Conversion.String()] += uint64(outputAmount)
+			stats.VolumeIn[tx.Conversion.String()] += uint64(outputAmount)
+		} else {
+			// one input, multiple outputs
+			stats.Volume[tx.Input.Type.String()] += tx.Input.Amount
+			stats.VolumeTx[tx.Input.Type.String()] += tx.Input.Amount
 			for _, transfer := range tx.Transfers {
 				_, err = d.Pegnet.AddToBalance(sqlTx, &transfer.Address, tx.Input.Type, transfer.Amount)
 				if err != nil {
@@ -623,7 +649,7 @@ type pegRequest struct {
 	TxIndex            int
 }
 
-func (d *Pegnetd) recordPegnetRequests(sqlTx *sql.Tx, txBatchs []*fat2.TransactionBatch, rates map[fat2.PTicker]uint64, currentHeight uint32, bank uint64, bankHeight int32) error {
+func (d *Pegnetd) recordPegnetRequests(sqlTx *sql.Tx, stats *pegnet.Stats, txBatchs []*fat2.TransactionBatch, rates map[fat2.PTicker]uint64, currentHeight uint32, bank uint64, bankHeight int32) error {
 	limit := conversions.NewConversionSupply(bank)
 	txData := make(map[string]pegRequest)
 
@@ -686,6 +712,12 @@ func (d *Pegnetd) recordPegnetRequests(sqlTx *sql.Tx, txBatchs []*fat2.Transacti
 		if _, err := d.Pegnet.AddToBalance(sqlTx, &tx.Input.Address, tx.Input.Type, uint64(refundAmt)); err != nil {
 			return err
 		}
+
+		// subtract refund from volume
+		stats.Volume[tx.Input.Type.String()] += tx.Input.Amount - uint64(refundAmt)
+		stats.VolumeOut[tx.Input.Type.String()] += tx.Input.Amount - uint64(refundAmt)
+		stats.Volume[tx.Conversion.String()] += uint64(pegYield)
+		stats.VolumeIn[tx.Conversion.String()] += uint64(pegYield)
 	}
 
 	// The bankheight == currentheight after V4Update fork
@@ -701,7 +733,7 @@ func (d *Pegnetd) recordPegnetRequests(sqlTx *sql.Tx, txBatchs []*fat2.Transacti
 
 // ApplyFactoidBlock applies the FCT burns that occurred within the given
 // DBlock. If an error is returned, the sql.Tx should be rolled back by the caller.
-func (d *Pegnetd) ApplyFactoidBlock(ctx context.Context, tx *sql.Tx, dblock *factom.DBlock) error {
+func (d *Pegnetd) ApplyFactoidBlock(ctx context.Context, tx *sql.Tx, stats *pegnet.Stats, dblock *factom.DBlock) error {
 	fblock := new(factom.FBlock)
 	fblock.Height = dblock.Height
 	if err := fblock.Get(nil, d.FactomClient); err != nil {
@@ -762,6 +794,9 @@ func (d *Pegnetd) ApplyFactoidBlock(ctx context.Context, tx *sql.Tx, dblock *fac
 		if err := d.Pegnet.InsertFCTBurn(tx, fblock.KeyMR, burns[i], dblock.Height); err != nil {
 			return err
 		}
+		stats.VolumeIn[fat2.PTickerFCT.String()] += burns[i].FCTInputs[0].Amount
+		stats.Volume[fat2.PTickerFCT.String()] += burns[i].FCTInputs[0].Amount
+		stats.Burns += burns[i].FCTInputs[0].Amount
 	}
 
 	return nil
@@ -769,7 +804,7 @@ func (d *Pegnetd) ApplyFactoidBlock(ctx context.Context, tx *sql.Tx, dblock *fac
 
 // ApplyGradedOPRBlock pays out PEG to the winners of the given GradedBlock.
 // If an error is returned, the sql.Tx should be rolled back by the caller.
-func (d *Pegnetd) ApplyGradedOPRBlock(tx *sql.Tx, gradedBlock grader.GradedBlock, timestamp time.Time) error {
+func (d *Pegnetd) ApplyGradedOPRBlock(tx *sql.Tx, stats *pegnet.Stats, gradedBlock grader.GradedBlock, timestamp time.Time) error {
 	winners := gradedBlock.Winners()
 	for i := range winners {
 		addr, err := factom.NewFAAddress(winners[i].OPR.GetAddress())
@@ -788,6 +823,8 @@ func (d *Pegnetd) ApplyGradedOPRBlock(tx *sql.Tx, gradedBlock grader.GradedBlock
 			return err
 		}
 
+		stats.Volume[fat2.PTickerPEG.String()] += uint64(winners[i].Payout())
+		stats.VolumeIn[fat2.PTickerPEG.String()] += uint64(winners[i].Payout())
 		if err := d.Pegnet.InsertCoinbase(tx, winners[i], addr[:], timestamp); err != nil {
 			return err
 		}
