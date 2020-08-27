@@ -23,6 +23,9 @@ func (d *Pegnetd) GradeS(ctx context.Context, block *factom.EBlock) (graderStake
 	if block.Height >= V20HeightActivation {
 		ver = 5
 	}
+	if block.Height >= SprSignatureActivation {
+		ver = 6
+	}
 
 	g, err := graderStake.NewGrader(ver, int32(block.Height))
 	if err != nil {
